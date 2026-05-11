@@ -4,16 +4,21 @@ declare(strict_types=1);
 
 namespace Phalanx\Athena\Tests\Integration;
 
+use Phalanx\Application;
 use Phalanx\Athena\Pipeline\Pipeline;
-use Phalanx\Scope;
+use Phalanx\Scope\Scope;
 use Phalanx\Task\Scopeable;
+use PHPUnit\Framework\Attributes\PreserveGlobalState;
+use PHPUnit\Framework\Attributes\RunTestsInSeparateProcesses;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 
+#[PreserveGlobalState(false)]
+#[RunTestsInSeparateProcesses]
 final class PipelineTest extends TestCase
 {
     #[Test]
-    public function pipeline_creates_immutably(): void
+    public function pipelineCreatesImmutably(): void
     {
         $p1 = Pipeline::create();
         $p2 = $p1->step(new AddSuffix(' world'));
@@ -22,54 +27,69 @@ final class PipelineTest extends TestCase
     }
 
     #[Test]
-    public function pipeline_with_input(): void
+    public function pipelineWithInput(): void
     {
         $pipeline = Pipeline::create()->run('test input');
 
-        $this->assertInstanceOf(Pipeline::class, $pipeline);
+        self::assertSame('test input', Application::starting()->run($pipeline));
     }
 
     #[Test]
-    public function pipeline_step_composition(): void
+    public function pipelineStepComposition(): void
     {
+        AddSuffix::$calls = [];
+
         $p = Pipeline::create()
             ->step(new AddSuffix(' first'))
             ->step(new AddSuffix(' second'));
 
-        $this->assertInstanceOf(Pipeline::class, $p);
+        self::assertSame('input second', Application::starting()->run($p));
+        self::assertSame([' first', ' second'], AddSuffix::$calls);
     }
 
     #[Test]
-    public function pipeline_branch_composition(): void
+    public function pipelineBranchComposition(): void
     {
         $p = Pipeline::create()
             ->step(new AddSuffix(' classified'))
-            ->branch(static fn(mixed $prev): Scopeable => new AddSuffix(' branched'));
+            ->branch(static fn(mixed $prev): Scopeable => new AddSuffix(' branched after ' . $prev));
 
-        $this->assertInstanceOf(Pipeline::class, $p);
+        self::assertSame('input branched after input classified', Application::starting()->run($p));
     }
 
     #[Test]
-    public function pipeline_fan_composition(): void
+    public function pipelineFanComposition(): void
     {
         $p = Pipeline::create()
-            ->fan([
+            ->fan(...[
                 new AddSuffix(' a'),
                 new AddSuffix(' b'),
                 new AddSuffix(' c'),
             ]);
 
-        $this->assertInstanceOf(Pipeline::class, $p);
+        self::assertSame([
+            'input a',
+            'input b',
+            'input c',
+        ], Application::starting()->run($p));
     }
 }
 
 /** @internal */
-final readonly class AddSuffix implements Scopeable
+final class AddSuffix implements Scopeable
 {
-    public function __construct(private string $suffix) {}
+    /** @var list<string> */
+    public static array $calls = [];
+
+    public function __construct(
+        private string $suffix,
+    ) {
+    }
 
     public function __invoke(Scope $scope): string
     {
+        self::$calls[] = $this->suffix;
+
         return 'input' . $this->suffix;
     }
 }

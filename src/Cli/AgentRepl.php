@@ -13,7 +13,7 @@ use Phalanx\Athena\Memory\ConversationMemory;
 use Phalanx\Athena\Message\Conversation;
 use Phalanx\Athena\Message\Message;
 use Phalanx\Athena\Turn;
-use Phalanx\Archon\CommandScope;
+use Phalanx\Archon\Command\CommandScope;
 
 /**
  * Interactive REPL runner for an AgentDefinition.
@@ -27,7 +27,7 @@ final class AgentRepl
 {
     public static function run(AgentDefinition $agent, CommandScope $scope, ?ConversationMemory $memory = null): int
     {
-        $sessionId = $scope->options->get('session', uniqid('cli_'));
+        $sessionId = $scope->options->get('session', uniqid('athena_'));
         $conversation = $memory?->load($sessionId) ?? Conversation::create();
         $verbose = $scope->options->has('verbose');
 
@@ -35,9 +35,16 @@ final class AgentRepl
         echo "Agent: " . $agent::class . "\n\n";
 
         while (true) {
-            $input = readline('> ');
+            fwrite(STDOUT, '> ');
+            $raw = fgets(STDIN);
 
-            if ($input === false || $input === 'exit') {
+            if ($raw === false) {
+                break;
+            }
+
+            $input = rtrim($raw, "\n\r");
+
+            if ($input === 'exit') {
                 break;
             }
 

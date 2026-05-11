@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Phalanx\Athena\Provider;
 
+use Phalanx\Cancellation\Cancelled;
+use Phalanx\Scope\ExecutionScope;
 use Phalanx\Styx\Channel;
 use Phalanx\Styx\Emitter;
 
@@ -15,13 +17,21 @@ final readonly class ProviderStrategy
 
         return new class ($list) implements LlmProvider {
             /** @param list<LlmProvider> $providers */
-            public function __construct(private array $providers) {}
+            public function __construct(private array $providers)
+            {
+            }
 
             public function generate(GenerateRequest $request): Emitter
             {
                 $providers = $this->providers;
 
-                return Emitter::produce(static function (Channel $ch, $ctx) use ($request, $providers): void {
+                return Emitter::produce(static function (
+                    Channel $ch,
+                    ExecutionScope $ctx,
+                ) use (
+                    $request,
+                    $providers,
+                ): void {
                     $firstProvider = $providers[0] ?? null;
                     if ($firstProvider === null) {
                         throw new \RuntimeException('No providers configured for race strategy');
@@ -41,19 +51,29 @@ final readonly class ProviderStrategy
 
         return new class ($list) implements LlmProvider {
             /** @param list<LlmProvider> $providers */
-            public function __construct(private array $providers) {}
+            public function __construct(private array $providers)
+            {
+            }
 
             public function generate(GenerateRequest $request): Emitter
             {
                 $providers = $this->providers;
 
-                return Emitter::produce(static function (Channel $ch, $ctx) use ($request, $providers): void {
+                return Emitter::produce(static function (
+                    Channel $ch,
+                    ExecutionScope $ctx,
+                ) use (
+                    $request,
+                    $providers,
+                ): void {
                     foreach ($providers as $provider) {
                         try {
                             foreach ($provider->generate($request)($ctx) as $event) {
                                 $ch->emit($event);
                             }
                             return;
+                        } catch (Cancelled $c) {
+                            throw $c;
                         } catch (\Throwable) {
                             continue;
                         }
@@ -73,7 +93,9 @@ final readonly class ProviderStrategy
             private int $index = 0;
 
             /** @param list<LlmProvider> $providers */
-            public function __construct(private array $providers) {}
+            public function __construct(private array $providers)
+            {
+            }
 
             public function generate(GenerateRequest $request): Emitter
             {

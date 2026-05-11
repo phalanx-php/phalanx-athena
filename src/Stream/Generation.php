@@ -4,13 +4,16 @@ declare(strict_types=1);
 
 namespace Phalanx\Athena\Stream;
 
+use Closure;
 use Phalanx\Athena\Event\AgentEvent;
 use Phalanx\Athena\Event\AgentEventKind;
 use Phalanx\Athena\Event\TokenUsage;
 use Phalanx\Athena\Tool\ToolCall;
 use Phalanx\Athena\Tool\ToolCallBag;
-use Phalanx\Stream\Contract\StreamContext;
+use Phalanx\Scope\ExecutionScope;
 use Phalanx\Styx\Emitter;
+use ReflectionFunction;
+use RuntimeException;
 
 final readonly class Generation
 {
@@ -18,10 +21,19 @@ final readonly class Generation
         public string $text,
         public ToolCallBag $toolCalls,
         public TokenUsage $usage,
-    ) {}
+    ) {
+    }
 
-    public static function collect(Emitter $events, StreamContext $ctx, ?callable $onEvent = null): self
+    /** @param ?Closure(AgentEvent): void $onEvent */
+    public static function collect(Emitter $events, ExecutionScope $ctx, ?Closure $onEvent = null): self
     {
+        if ($onEvent !== null && !new ReflectionFunction($onEvent)->isStatic()) {
+            throw new RuntimeException(
+                'Generation::collect() $onEvent must be a static closure. Non-static '
+                . 'closures capture $this and leak in long-running coroutines.',
+            );
+        }
+
         $text = '';
         $toolCalls = [];
         $usage = TokenUsage::zero();

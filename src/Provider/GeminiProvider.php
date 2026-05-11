@@ -7,83 +7,90 @@ namespace Phalanx\Athena\Provider;
 use Phalanx\Athena\Event\AgentEvent;
 use Phalanx\Athena\Event\TokenDelta;
 use Phalanx\Athena\Event\TokenUsage;
-use Phalanx\Athena\Stream\SseParser;
+use Phalanx\Athena\Http\Url;
+use Phalanx\Athena\Stream\HttpSseSource;
+use Phalanx\Iris\HttpClient;
+use Phalanx\Iris\HttpRequest;
+use Phalanx\Scope\ExecutionScope;
+use Phalanx\Styx\Channel;
 use Phalanx\Styx\Emitter;
-use React\Http\Browser;
-use React\Stream\ReadableStreamInterface;
-use React\Promise\Deferred;
-use Phalanx\Stream\Contract\StreamContext;
+use RuntimeException;
 
+/**
+ * Google Gemini streaming provider.
+ *
+ * Hits `/v1beta/models/{model}:streamGenerateContent?alt=sse&key=...`
+ * through Iris outbound HTTP. The response is
+ * an SSE stream where each `data:` line is a full JSON envelope; we
+ * accumulate per-part text, surface token usage from `usageMetadata`
+ * on the trailing chunks, and emit one `tokenComplete` at end-of-stream.
+ */
 final class GeminiProvider implements LlmProvider
 {
-    private Browser $browser;
-
     public function __construct(
         private readonly GeminiConfig $config,
+        private readonly HttpClient $client,
     ) {
-        $this->browser = new Browser()
-            ->withTimeout(120.0)
-            ->withFollowRedirects(false)
-            ->withRejectErrorResponse(false);
     }
 
     public function generate(GenerateRequest $request): Emitter
     {
         $config = $this->config;
-        $browser = $this->browser;
+        $client = $this->client;
 
-        return Emitter::produce(static function ($channel, $ctx) use ($request, $config, $browser) {
+        return Emitter::produce(static function (
+            Channel $channel,
+            ExecutionScope $ctx,
+        ) use (
+            $request,
+            $config,
+            $client,
+        ): void {
             $model = $request->model ?? $config->model;
             $body = self::buildRequestBody($request);
+            $startTime = hrtime(true);
+            $step = 0;
+            $usage = TokenUsage::zero();
+
             $jsonBody = json_encode($body, JSON_THROW_ON_ERROR);
-            
-            $url = sprintf(
-                '%s/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s',
-                $config->baseUrl,
-                $model,
-                $config->apiKey
+            $endpoint = sprintf(
+                '/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s',
+                rawurlencode($model),
+                rawurlencode($config->apiKey),
             );
+            $httpRequest = HttpRequest::post(Url::join($config->baseUrl, $endpoint), $jsonBody, [
+                'content-type' => ['application/json'],
+                'accept' => ['text/event-stream'],
+            ]);
 
-            $response = $ctx->await($browser->requestStreaming('POST', $url, ['Content-Type' => 'application/json'], $jsonBody));
+            $stream = $client->stream($ctx, $httpRequest);
+            $ctx->onDispose(static fn() => $stream->close());
 
-            if ($response->getStatusCode() >= 400) {
-                 $body = (string)$response->getBody();
-                 throw new \RuntimeException("Gemini API Error {$response->getStatusCode()} for model {$model}: {$body}");
+            $source = new HttpSseSource($stream);
+
+            foreach ($source->events($ctx) as $sseEvent) {
+                $ctx->throwIfCancelled();
+                $data = $sseEvent['data'];
+                if ($data === '' || $data === '[DONE]') {
+                    continue;
+                }
+
+                if ($stream->status >= 400) {
+                    throw new RuntimeException("Gemini API {$stream->status} for model {$model}: {$data}");
+                }
+
+                $parsed = json_decode($data, true, 512, JSON_THROW_ON_ERROR);
+                if (!is_array($parsed)) {
+                    continue;
+                }
+                $elapsed = (hrtime(true) - $startTime) / 1e6;
+
+                self::onUsage($parsed, $usage);
+                self::onCandidates($parsed, $channel, $elapsed, $usage, $step);
             }
 
-            $bodyStream = $response->getBody();
-            $parser = new SseParser();
-            $usage = TokenUsage::zero();
-            
-            $bodyStream->on('data', static function (string $chunk) use ($channel, $parser, &$usage) {
-                foreach ($parser->feed($chunk) as $event) {
-                    $parsed = json_decode($event['data'], true);
-                    if (!$parsed) continue;
-
-                    $candidates = $parsed['candidates'] ?? [];
-                    foreach ($candidates as $candidate) {
-                        $parts = $candidate['content']['parts'] ?? [];
-                        foreach ($parts as $part) {
-                            if (isset($part['text'])) {
-                                $channel->emit(AgentEvent::tokenDelta(new TokenDelta($part['text']), 0, $usage, 0));
-                            }
-                        }
-                    }
-
-                    if (isset($parsed['usageMetadata'])) {
-                        $usage = new TokenUsage(
-                            input: (int) ($parsed['usageMetadata']['promptTokenCount'] ?? $usage->input),
-                            output: (int) ($parsed['usageMetadata']['candidatesTokenCount'] ?? $usage->output),
-                        );
-                    }
-                }
-            });
-
-            $done = new Deferred();
-            $bodyStream->on('end', static fn() => $done->resolve(null));
-            $ctx->await($done->promise());
-            
-            $channel->emit(AgentEvent::tokenComplete(0, $usage, 0));
+            $finalElapsed = (hrtime(true) - $startTime) / 1e6;
+            $channel->emit(AgentEvent::tokenComplete($finalElapsed, $usage, $step));
             $channel->complete();
         });
     }
@@ -92,27 +99,74 @@ final class GeminiProvider implements LlmProvider
     private static function buildRequestBody(GenerateRequest $request): array
     {
         $contents = [];
-        
         foreach ($request->conversation->messages as $msg) {
             $contents[] = [
                 'role' => $msg->role->value === 'assistant' ? 'model' : 'user',
-                'parts' => [['text' => $msg->text]]
+                'parts' => [['text' => $msg->text]],
             ];
         }
 
-        // If contents is empty, we MUST add a user message
         if ($contents === []) {
             $contents[] = ['role' => 'user', 'parts' => [['text' => 'Hello']]];
         }
 
         $body = ['contents' => $contents];
 
-        // For gemini-flash-lite, we try putting instructions in system_instruction
-        // but if it still fails, we'll have to merge it into the first user message.
         if ($request->conversation->systemPrompt !== null) {
             $body['system_instruction'] = ['parts' => [['text' => $request->conversation->systemPrompt]]];
         }
 
         return $body;
+    }
+
+    /** @param array<string, mixed> $parsed */
+    private static function onUsage(array $parsed, TokenUsage &$usage): void
+    {
+        $meta = $parsed['usageMetadata'] ?? null;
+        if (!is_array($meta)) {
+            return;
+        }
+        $usage = new TokenUsage(
+            input: (int) ($meta['promptTokenCount'] ?? $usage->input),
+            output: (int) ($meta['candidatesTokenCount'] ?? $usage->output),
+        );
+    }
+
+    /** @param array<string, mixed> $parsed */
+    private static function onCandidates(
+        array $parsed,
+        Channel $channel,
+        float $elapsed,
+        TokenUsage $usage,
+        int $step,
+    ): void {
+        $candidates = $parsed['candidates'] ?? [];
+        if (!is_array($candidates)) {
+            return;
+        }
+        foreach ($candidates as $candidate) {
+            if (!is_array($candidate)) {
+                continue;
+            }
+            $parts = $candidate['content']['parts'] ?? [];
+            if (!is_array($parts)) {
+                continue;
+            }
+            foreach ($parts as $part) {
+                if (!is_array($part)) {
+                    continue;
+                }
+                $text = $part['text'] ?? null;
+                if (!is_string($text) || $text === '') {
+                    continue;
+                }
+                $channel->emit(AgentEvent::tokenDelta(
+                    new TokenDelta(text: $text),
+                    $elapsed,
+                    $usage,
+                    $step,
+                ));
+            }
+        }
     }
 }

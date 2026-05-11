@@ -8,156 +8,124 @@ use Phalanx\Athena\Event\AgentEvent;
 use Phalanx\Athena\Event\TokenDelta;
 use Phalanx\Athena\Event\TokenUsage;
 use Phalanx\Athena\Event\ToolCallData;
-use Phalanx\Athena\Stream\SseParser;
+use Phalanx\Athena\Http\Url;
+use Phalanx\Athena\Stream\HttpSseSource;
+use Phalanx\Iris\HttpClient;
+use Phalanx\Iris\HttpRequest;
+use Phalanx\Scope\ExecutionScope;
+use Phalanx\Styx\Channel;
 use Phalanx\Styx\Emitter;
-use React\Http\Browser;
-use React\Stream\ReadableStreamInterface;
+use RuntimeException;
 
-use React\Promise\Deferred;
-
-use Phalanx\Stream\Contract\StreamContext;
-
+/**
+ * Anthropic Claude streaming provider.
+ *
+ * Speaks Anthropic's `/v1/messages` SSE endpoint through Iris outbound
+ * HTTP. The producer body reads top-to-bottom as a synchronous
+ * coroutine: open stream, iterate SSE events via {@see HttpSseSource},
+ * and dispatch `AgentEvent`s onto the producer's channel.
+ *
+ * The HttpClient is injected (test doubles for canned-stream coverage,
+ * production constructed from Iris defaults).
+ */
 final class AnthropicProvider implements LlmProvider
 {
-    private Browser $browser;
-
     public function __construct(
         private readonly AnthropicConfig $config,
+        private readonly HttpClient $client,
     ) {
-        $this->browser = new Browser()
-            ->withTimeout(120.0)
-            ->withFollowRedirects(false)
-            ->withRejectErrorResponse(false);
     }
 
     public function generate(GenerateRequest $request): Emitter
     {
         $config = $this->config;
-        $browser = $this->browser;
+        $client = $this->client;
 
-        return Emitter::produce(static function ($channel, $ctx) use ($request, $config, $browser) {
+        return Emitter::produce(static function (
+            Channel $channel,
+            ExecutionScope $ctx,
+        ) use (
+            $request,
+            $config,
+            $client,
+        ): void {
             $model = $request->model ?? $config->model;
-            $body = self::buildRequestBody($request, $model, $config);
+            $body = self::buildRequestBody($request, $model);
             $headers = self::buildHeaders($config);
             $startTime = hrtime(true);
             $step = 0;
             $usage = TokenUsage::zero();
 
             $jsonBody = json_encode($body, JSON_THROW_ON_ERROR);
+            $httpRequest = HttpRequest::post(Url::join($config->baseUrl, '/v1/messages'), $jsonBody, $headers);
+            $stream = $client->stream($ctx, $httpRequest);
+            $ctx->onDispose(static fn() => $stream->close());
 
-            $response = $ctx->await($browser->requestStreaming(
-                'POST',
-                $config->baseUrl . '/v1/messages',
-                $headers,
-                $jsonBody,
-            ));
+            // Force header parsing so status is available before entering the SSE loop.
+            $stream->read($ctx, 0);
 
-            $statusCode = $response->getStatusCode();
-            if ($statusCode >= 400) {
-                $errStream = $response->getBody();
-                $errBuf = '';
-                if ($errStream instanceof ReadableStreamInterface) {
-                    $errDone = new Deferred();
-                    $errStream->on('data', static function (string $d) use (&$errBuf): void { $errBuf .= $d; });
-                    $errStream->on('end', static function () use ($errDone): void { $errDone->resolve(null); });
-                    $errStream->on('error', static function () use ($errDone): void { $errDone->resolve(null); });
-                    $ctx->await($errDone->promise());
+            if ($stream->status >= 400) {
+                $errorBody = '';
+                while (!$stream->eof) {
+                    $errorBody .= $stream->read($ctx);
                 }
-                throw new \RuntimeException("Anthropic API {$statusCode}: {$errBuf}");
+                throw new RuntimeException("Anthropic API {$stream->status}: {$errorBody}");
             }
 
-            /** @var ReadableStreamInterface $body */
-            $body = $response->getBody();
-            $ctx->onDispose(static fn() => $body->close());
-
-            $parser = new SseParser();
+            $source = new HttpSseSource($stream);
             $accumulatedText = '';
             $currentToolId = null;
             $currentToolName = null;
             $currentToolInput = '';
 
-            foreach (self::readChunks($body, $ctx) as $chunk) {
+            foreach ($source->events($ctx) as $sseEvent) {
                 $ctx->throwIfCancelled();
-
-                foreach ($parser->feed($chunk) as $sseEvent) {
-                    $data = $sseEvent['data'];
-
-                    if ($data === '[DONE]') {
-                        break;
-                    }
-
-                    $parsed = json_decode($data, true, 512, JSON_THROW_ON_ERROR);
-                    $type = $parsed['type'] ?? '';
-                    $elapsed = (hrtime(true) - $startTime) / 1e6;
-
-                    match ($type) {
-                        'message_start' => (function () use (&$usage, $parsed) {
-                            $u = $parsed['message']['usage'] ?? [];
-                            $usage = new TokenUsage(
-                                input: (int) ($u['input_tokens'] ?? 0),
-                                output: 0,
-                            );
-                        })(),
-
-                        'content_block_start' => (function () use ($parsed, &$currentToolId, &$currentToolName, &$currentToolInput, $channel, $elapsed, $usage, $step) {
-                            $block = $parsed['content_block'] ?? [];
-                            if (($block['type'] ?? '') === 'tool_use') {
-                                $currentToolId = $block['id'] ?? '';
-                                $currentToolName = $block['name'] ?? '';
-                                $currentToolInput = '';
-                                $channel->emit(AgentEvent::toolCallStart(
-                                    new ToolCallData($currentToolId, $currentToolName),
-                                    $elapsed, $usage, $step,
-                                ));
-                            }
-                        })(),
-
-                        'content_block_delta' => (function () use ($parsed, &$accumulatedText, &$currentToolInput, $channel, $elapsed, $usage, $step) {
-                            $delta = $parsed['delta'] ?? [];
-                            $deltaType = $delta['type'] ?? '';
-
-                            if ($deltaType === 'text_delta') {
-                                $text = $delta['text'] ?? '';
-                                $accumulatedText .= $text;
-                                $channel->emit(AgentEvent::tokenDelta(
-                                    new TokenDelta(text: $text),
-                                    $elapsed, $usage, $step,
-                                ));
-                            } elseif ($deltaType === 'input_json_delta') {
-                                $currentToolInput .= $delta['partial_json'] ?? '';
-                            }
-                        })(),
-
-                        'content_block_stop' => (function () use (&$currentToolId, &$currentToolName, &$currentToolInput, $channel, $elapsed, $usage, $step) {
-                            if ($currentToolId !== null) {
-                                $args = $currentToolInput !== ''
-                                    ? json_decode($currentToolInput, true, 512, JSON_THROW_ON_ERROR)
-                                    : [];
-                                $channel->emit(AgentEvent::toolCallComplete(
-                                    new ToolCallData($currentToolId, $currentToolName, $args),
-                                    $elapsed, $usage, $step,
-                                ));
-                                $currentToolId = null;
-                                $currentToolName = null;
-                                $currentToolInput = '';
-                            }
-                        })(),
-
-                        'message_delta' => (function () use (&$usage, $parsed) {
-                            $u = $parsed['usage'] ?? [];
-                            $usage = new TokenUsage(
-                                input: $usage->input,
-                                output: (int) ($u['output_tokens'] ?? $usage->output),
-                            );
-                        })(),
-
-                        'message_stop' => $channel->emit(
-                            AgentEvent::tokenComplete($elapsed, $usage, $step)
-                        ),
-
-                        default => null,
-                    };
+                $data = $sseEvent['data'];
+                if ($data === '[DONE]') {
+                    break;
                 }
+
+                $parsed = json_decode($data, true, 512, JSON_THROW_ON_ERROR);
+                if (!is_array($parsed)) {
+                    continue;
+                }
+                $type = (string) ($parsed['type'] ?? '');
+                $elapsed = (hrtime(true) - $startTime) / 1e6;
+
+                match ($type) {
+                    'message_start' => self::onMessageStart($parsed, $usage),
+                    'content_block_start' => self::onContentBlockStart(
+                        $parsed,
+                        $currentToolId,
+                        $currentToolName,
+                        $currentToolInput,
+                        $channel,
+                        $elapsed,
+                        $usage,
+                        $step,
+                    ),
+                    'content_block_delta' => self::onContentBlockDelta(
+                        $parsed,
+                        $accumulatedText,
+                        $currentToolInput,
+                        $channel,
+                        $elapsed,
+                        $usage,
+                        $step,
+                    ),
+                    'content_block_stop' => self::onContentBlockStop(
+                        $currentToolId,
+                        $currentToolName,
+                        $currentToolInput,
+                        $channel,
+                        $elapsed,
+                        $usage,
+                        $step,
+                    ),
+                    'message_delta' => self::onMessageDelta($parsed, $usage),
+                    'message_stop' => $channel->emit(AgentEvent::tokenComplete($elapsed, $usage, $step)),
+                    default => null,
+                };
             }
 
             $channel->complete();
@@ -165,7 +133,7 @@ final class AnthropicProvider implements LlmProvider
     }
 
     /** @return array<string, mixed> */
-    private static function buildRequestBody(GenerateRequest $request, string $model, AnthropicConfig $config): array
+    private static function buildRequestBody(GenerateRequest $request, string $model): array
     {
         $body = [
             'model' => $model,
@@ -194,75 +162,119 @@ final class AnthropicProvider implements LlmProvider
         return $body;
     }
 
-    /** @return array<string, string> */
+    /** @return array<string, list<string>> */
     private static function buildHeaders(AnthropicConfig $config): array
     {
         return [
-            'Content-Type' => 'application/json',
-            'x-api-key' => $config->apiKey,
-            'anthropic-version' => $config->apiVersion,
+            'content-type' => ['application/json'],
+            'x-api-key' => [$config->apiKey],
+            'anthropic-version' => [$config->apiVersion],
+            'accept' => ['text/event-stream'],
         ];
     }
 
-    /** @return \Generator<int, string, mixed, void> */
-    private static function readChunks(ReadableStreamInterface $body, StreamContext $ctx): \Generator
+    /** @param array<string, mixed> $parsed */
+    private static function onMessageStart(array $parsed, TokenUsage &$usage): void
     {
-        $buffer = '';
-        $ended = false;
-        /** @var \React\Promise\Deferred<bool>|null $waiting */
-        $waiting = null;
-        $abandoned = false;
+        $message = $parsed['message'] ?? [];
+        $u = is_array($message) ? ($message['usage'] ?? []) : [];
+        $usage = new TokenUsage(
+            input: (int) (is_array($u) ? ($u['input_tokens'] ?? 0) : 0),
+            output: 0,
+        );
+    }
 
-        $body->on('data', static function (string $data) use (&$buffer, &$waiting, &$abandoned): void {
-            if ($abandoned) { // @phpstan-ignore if.alwaysFalse
-                return;
-            }
-            $buffer .= $data;
-            if ($waiting !== null) {
-                $d = $waiting;
-                $waiting = null;
-                $d->resolve(true);
-            }
-        });
-
-        $body->on('end', static function () use (&$ended, &$waiting, &$abandoned): void {
-            if ($abandoned) { // @phpstan-ignore if.alwaysFalse
-                return;
-            }
-            $ended = true;
-            if ($waiting !== null) {
-                $d = $waiting;
-                $waiting = null;
-                $d->resolve(false);
-            }
-        });
-
-        $body->on('error', static function () use (&$ended, &$waiting, &$abandoned): void {
-            if ($abandoned) { // @phpstan-ignore if.alwaysFalse
-                return;
-            }
-            $ended = true;
-            if ($waiting !== null) {
-                $d = $waiting;
-                $waiting = null;
-                $d->resolve(false);
-            }
-        });
-
-        try {
-            while (!$ended || $buffer !== '') {
-                if ($buffer !== '') {
-                    $chunk = $buffer;
-                    $buffer = '';
-                    yield $chunk;
-                } else {
-                    $waiting = new Deferred();
-                    $ctx->await($waiting->promise());
-                }
-            }
-        } finally {
-            $abandoned = true;
-            $waiting = null;
+    /** @param array<string, mixed> $parsed */
+    private static function onContentBlockStart(
+        array $parsed,
+        ?string &$currentToolId,
+        ?string &$currentToolName,
+        string &$currentToolInput,
+        Channel $channel,
+        float $elapsed,
+        TokenUsage $usage,
+        int $step,
+    ): void {
+        $block = $parsed['content_block'] ?? [];
+        if (!is_array($block) || ($block['type'] ?? '') !== 'tool_use') {
+            return;
         }
+        $currentToolId = (string) ($block['id'] ?? '');
+        $currentToolName = (string) ($block['name'] ?? '');
+        $currentToolInput = '';
+        $channel->emit(AgentEvent::toolCallStart(
+            new ToolCallData($currentToolId, $currentToolName),
+            $elapsed,
+            $usage,
+            $step,
+        ));
+    }
+
+    /** @param array<string, mixed> $parsed */
+    private static function onContentBlockDelta(
+        array $parsed,
+        string &$accumulatedText,
+        string &$currentToolInput,
+        Channel $channel,
+        float $elapsed,
+        TokenUsage $usage,
+        int $step,
+    ): void {
+        $delta = $parsed['delta'] ?? [];
+        if (!is_array($delta)) {
+            return;
+        }
+        $deltaType = (string) ($delta['type'] ?? '');
+
+        if ($deltaType === 'text_delta') {
+            $text = (string) ($delta['text'] ?? '');
+            $accumulatedText .= $text;
+            $channel->emit(AgentEvent::tokenDelta(new TokenDelta(text: $text), $elapsed, $usage, $step));
+        } elseif ($deltaType === 'input_json_delta') {
+            $currentToolInput .= (string) ($delta['partial_json'] ?? '');
+        }
+    }
+
+    /**
+     * @param-out null $currentToolId
+     * @param-out null $currentToolName
+     */
+    private static function onContentBlockStop(
+        ?string &$currentToolId,
+        ?string &$currentToolName,
+        string &$currentToolInput,
+        Channel $channel,
+        float $elapsed,
+        TokenUsage $usage,
+        int $step,
+    ): void {
+        if ($currentToolId === null) {
+            return;
+        }
+        $args = $currentToolInput !== ''
+            ? json_decode($currentToolInput, true, 512, JSON_THROW_ON_ERROR)
+            : [];
+        $channel->emit(AgentEvent::toolCallComplete(
+            new ToolCallData($currentToolId, $currentToolName ?? '', is_array($args) ? $args : []),
+            $elapsed,
+            $usage,
+            $step,
+        ));
+        $currentToolId = null;
+        $currentToolName = null;
+        $currentToolInput = '';
+    }
+
+    /** @param array<string, mixed> $parsed */
+    private static function onMessageDelta(array $parsed, TokenUsage &$usage): void
+    {
+        $u = $parsed['usage'] ?? [];
+        if (!is_array($u)) {
+            return;
+        }
+        $usage = new TokenUsage(
+            input: $usage->input,
+            output: (int) ($u['output_tokens'] ?? $usage->output),
+        );
     }
 }

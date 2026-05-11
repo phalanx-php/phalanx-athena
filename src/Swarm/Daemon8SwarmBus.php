@@ -4,128 +4,31 @@ declare(strict_types=1);
 
 namespace Phalanx\Athena\Swarm;
 
-use Phalanx\Styx\Emitter;
+use Phalanx\Athena\Http\Url;
+use Phalanx\Athena\Stream\HttpSseSource;
+use Phalanx\Iris\HttpClient;
+use Phalanx\Iris\HttpClientException;
+use Phalanx\Iris\HttpRequest;
+use Phalanx\Scope\ExecutionScope;
+use Phalanx\Scope\Scope;
+use Phalanx\Scope\Suspendable;
 use Phalanx\Styx\Channel;
-use React\Http\Browser;
-use React\Stream\ReadableStreamInterface;
-use React\Promise\Deferred;
-use Phalanx\Athena\Stream\SseParser;
-use Phalanx\Support\ErrorHandler;
-use Phalanx\Stream\Contract\StreamContext;
+use Phalanx\Styx\Emitter;
+use RuntimeException;
 
 /**
  * Swarm bus implementation using Daemon8 as the central blackboard.
+ *
+ * `emit` POSTs to `/ingest`; `subscribe` opens an SSE stream against
+ * `/api/stream`. Both flow through Iris outbound {@see HttpClient}
+ * so cancellation, wait reasons, and disposal stay visible.
  */
 final class Daemon8SwarmBus implements SwarmBus
 {
-    private Browser $browser;
-
     public function __construct(
         private readonly SwarmConfig $config,
+        private readonly HttpClient $client,
     ) {
-        $this->browser = new Browser()
-            ->withTimeout(3600.0) // 1 hour timeout for long-lived streams
-            ->withFollowRedirects(false)
-            ->withRejectErrorResponse(false);
-    }
-
-    public function emit(SwarmEvent $event): void
-    {
-        $payload = [
-            'kind' => 'custom',
-            'channel' => 'swarm_message',
-            'severity' => 'info',
-            'app' => $this->config->app,
-            'data' => $event->toArray(),
-        ];
-
-        $this->browser->post(
-            "{$this->config->daemon8Url}/ingest",
-            ['Content-Type' => 'application/json'],
-            json_encode($payload, JSON_THROW_ON_ERROR)
-        )->catch(static function (\Throwable $e): void {
-            ErrorHandler::report('Daemon8 swarm ingest failed: ' . $e->getMessage());
-        });
-    }
-
-    public function subscribe(array $filters = []): Emitter
-    {
-        $config = $this->config;
-        $browser = $this->browser;
-        
-        $query = http_build_query([
-            'kinds' => 'custom',
-            'origins' => 'app:' . $config->app,
-        ]);
-        $url = "{$config->daemon8Url}/api/stream?{$query}";
-
-        return Emitter::produce(static function (Channel $channel, StreamContext $ctx) use ($browser, $url, $filters): void {
-            $response = $ctx->await($browser->requestStreaming('GET', $url));
-
-            if ($response->getStatusCode() >= 400) {
-                 throw new \RuntimeException("Daemon8 Stream Error {$response->getStatusCode()}");
-            }
-
-            $bodyStream = $response->getBody();
-            if (!$bodyStream instanceof ReadableStreamInterface) {
-                $channel->complete();
-                return;
-            }
-
-            $ctx->onDispose(static fn() => $bodyStream->close());
-
-            $parser = new SseParser();
-            
-            $buffer = '';
-            $ended = false;
-            /** @var Deferred<bool>|null $waiting */
-            $waiting = null;
-
-            $bodyStream->on('data', static function (string $data) use (&$buffer, &$waiting): void {
-                $buffer .= $data;
-                if ($waiting instanceof Deferred) {
-                    $d = $waiting;
-                    $waiting = null;
-                    $d->resolve(true);
-                }
-            });
-
-            $bodyStream->on('end', static function () use (&$ended, &$waiting): void {
-                $ended = true;
-                if ($waiting instanceof Deferred) {
-                    $d = $waiting;
-                    $waiting = null;
-                    $d->resolve(false);
-                }
-            });
-
-            while (!$ended || $buffer !== '') {
-                if ($buffer !== '') {
-                    $chunk = $buffer;
-                    $buffer = '';
-                    
-                    foreach ($parser->feed($chunk) as $sseEvent) {
-                        $data = $sseEvent['data'];
-                        if ($data === '' || $data === '[DONE]') continue;
-                        
-                        $obs = json_decode($data, true);
-                        if (!is_array($obs)) {
-                            continue;
-                        }
-
-                        $event = self::eventFromObservation($obs, $filters);
-                        if ($event !== null) {
-                            $channel->emit($event);
-                        }
-                    }
-                } else {
-                    $waiting = new Deferred();
-                    $ctx->await($waiting->promise());
-                }
-            }
-            
-            $channel->complete();
-        });
     }
 
     /**
@@ -162,6 +65,87 @@ final class Daemon8SwarmBus implements SwarmBus
         );
     }
 
+    public function emit(Scope&Suspendable $scope, SwarmEvent $event): void
+    {
+        $payload = [
+            'kind' => 'custom',
+            'channel' => 'swarm_message',
+            'severity' => 'info',
+            'app' => $this->config->app,
+            'data' => $event->toArray(),
+        ];
+
+        try {
+            $stream = $this->client->stream($scope, HttpRequest::post(
+                Url::join($this->config->daemon8Url, '/ingest'),
+                json_encode($payload, JSON_THROW_ON_ERROR),
+                ['content-type' => ['application/json']],
+            ));
+            try {
+                while (!$stream->eof) {
+                    $stream->read($scope);
+                }
+                if ($stream->status >= 400) {
+                    error_log("Daemon8 swarm ingest failed: HTTP {$stream->status}");
+                }
+            } finally {
+                $stream->close();
+            }
+        } catch (HttpClientException $e) {
+            error_log('Daemon8 swarm ingest failed: ' . $e->getMessage());
+        }
+    }
+
+    public function subscribe(array $filters = []): Emitter
+    {
+        $client = $this->client;
+        $config = $this->config;
+
+        $query = http_build_query([
+            'kinds' => 'custom',
+            'origins' => 'app:' . $config->app,
+        ]);
+        $url = Url::join($config->daemon8Url, "/api/stream?{$query}");
+
+        return Emitter::produce(static function (
+            Channel $channel,
+            ExecutionScope $ctx,
+        ) use (
+            $client,
+            $url,
+            $filters,
+        ): void {
+            $stream = $client->stream($ctx, HttpRequest::get($url, ['accept' => ['text/event-stream']]));
+            $ctx->onDispose(static fn() => $stream->close());
+
+            if ($stream->status >= 400) {
+                throw new RuntimeException("Daemon8 stream error {$stream->status}");
+            }
+
+            $source = new HttpSseSource($stream);
+
+            foreach ($source->events($ctx) as $sseEvent) {
+                $ctx->throwIfCancelled();
+                $data = $sseEvent['data'];
+                if ($data === '' || $data === '[DONE]') {
+                    continue;
+                }
+
+                $obs = json_decode($data, true);
+                if (!is_array($obs)) {
+                    continue;
+                }
+
+                $event = self::eventFromObservation($obs, $filters);
+                if ($event !== null) {
+                    $channel->emit($event);
+                }
+            }
+
+            $channel->complete();
+        });
+    }
+
     /**
      * @param array<string, mixed> $data
      * @param array<string, mixed> $filters
@@ -169,28 +153,40 @@ final class Daemon8SwarmBus implements SwarmBus
     private static function matches(array $data, array $filters): bool
     {
         foreach ($filters as $key => $target) {
-            if ($target === null) continue;
+            if ($target === null) {
+                continue;
+            }
 
             $actual = match ($key) {
                 'kinds' => $data['kind'] ?? null,
                 default => $data[$key] ?? null,
             };
-            
+
             if ($key === 'addressed_to') {
-                if ($target === 'ALL') continue;
-                if ($actual === 'ALL') continue;
-                
+                if ($target === 'ALL') {
+                    continue;
+                }
+                if ($actual === 'ALL') {
+                    continue;
+                }
+
                 $targets = array_map(self::normalizeFilterValue(...), (array) $target);
                 $actuals = array_map(self::normalizeFilterValue(...), (array) $actual);
-                if (empty(array_intersect($targets, $actuals))) return false;
+                if (empty(array_intersect($targets, $actuals))) {
+                    return false;
+                }
                 continue;
             }
 
             if (is_array($target)) {
                 $targets = array_map(self::normalizeFilterValue(...), $target);
-                if (!in_array(self::normalizeFilterValue($actual), $targets, true)) return false;
+                if (!in_array(self::normalizeFilterValue($actual), $targets, true)) {
+                    return false;
+                }
             } elseif ($actual !== $target) {
-                if (self::normalizeFilterValue($actual) !== self::normalizeFilterValue($target)) return false;
+                if (self::normalizeFilterValue($actual) !== self::normalizeFilterValue($target)) {
+                    return false;
+                }
             }
         }
 

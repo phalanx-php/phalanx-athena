@@ -8,12 +8,16 @@ use Phalanx\Athena\Swarm\Daemon8SwarmBus;
 use Phalanx\Athena\Swarm\SwarmConfig;
 use Phalanx\Athena\Swarm\SwarmEvent;
 use Phalanx\Athena\Swarm\SwarmEventKind;
+use Phalanx\Iris\HttpClient;
+use Phalanx\Scope\ExecutionScope;
+use Phalanx\Tests\Support\CoroutineTestCase;
 use PHPUnit\Framework\Attributes\Group;
-use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\Test;
 
-class Daemon8SwarmBusTest extends TestCase
+class Daemon8SwarmBusTest extends CoroutineTestCase
 {
-    public function test_it_parses_current_daemon8_custom_channel_shape(): void
+    #[Test]
+    public function testItParsesCurrentDaemon8CustomChannelShape(): void
     {
         $event = Daemon8SwarmBus::eventFromObservation([
             'kind' => [
@@ -26,7 +30,7 @@ class Daemon8SwarmBusTest extends TestCase
                 'trace_id' => 'trace_1',
                 'causation_id' => null,
                 'workspace' => 'rtntv',
-                'session' => 'phx-agents',
+                'session' => 'swarm-test',
                 'from' => 'VISION',
                 'addressed_to' => ['ADMIN'],
                 'kind' => 'planning_proposal',
@@ -45,14 +49,15 @@ class Daemon8SwarmBusTest extends TestCase
     }
 
     #[Group('live')]
-    public function test_it_can_emit_to_daemon8(): void
+    #[Test]
+    public function testItCanEmitToDaemon8(): void
     {
         $config = new SwarmConfig(
             workspace: 'test-ws',
             session: 'test-session',
             daemon8Url: 'http://localhost:9077'
         );
-        $bus = new Daemon8SwarmBus($config);
+        $bus = new Daemon8SwarmBus($config, new HttpClient());
 
         $event = new SwarmEvent(
             from: 'TEST_AGENT',
@@ -61,9 +66,10 @@ class Daemon8SwarmBusTest extends TestCase
             session: 'test-session'
         );
 
-        // This will attempt a real network call to localhost:9077
-        $bus->emit($event);
-        
+        $this->runScoped(static function (ExecutionScope $scope) use ($bus, $event): void {
+            $bus->emit($scope, $event);
+        });
+
         $this->assertTrue(true, 'Emit did not crash');
     }
 }

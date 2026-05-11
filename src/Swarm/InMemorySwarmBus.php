@@ -4,9 +4,11 @@ declare(strict_types=1);
 
 namespace Phalanx\Athena\Swarm;
 
-use Phalanx\Styx\Emitter;
+use Phalanx\Scope\Scope;
+use Phalanx\Scope\ExecutionScope;
+use Phalanx\Scope\Suspendable;
 use Phalanx\Styx\Channel;
-use Phalanx\Stream\Contract\StreamContext;
+use Phalanx\Styx\Emitter;
 
 /**
  * In-memory implementation of the swarm bus.
@@ -17,34 +19,61 @@ final class InMemorySwarmBus implements SwarmBus
     /** @var list<Channel> */
     private array $subscribers = [];
 
-    public function emit(SwarmEvent $event): void
+    public function emit(Scope&Suspendable $scope, SwarmEvent $event): void
     {
         foreach ($this->subscribers as $channel) {
             $channel->emit($event);
         }
     }
 
+    public function close(): void
+    {
+        foreach ($this->subscribers as $channel) {
+            $channel->complete();
+        }
+        $this->subscribers = [];
+    }
+
     public function subscribe(array $filters = []): Emitter
     {
-        return Emitter::produce(function (Channel $out, StreamContext $scope) use ($filters): void {
+        $bus = $this;
+
+        return Emitter::produce(static function (Channel $out, ExecutionScope $scope) use ($bus, $filters): void {
             $subscriber = new Channel();
-            $this->subscribers[] = $subscriber;
-            
-            $scope->onDispose(function () use ($subscriber): void {
-                $idx = array_search($subscriber, $this->subscribers, true);
+            $bus->subscribers[] = $subscriber;
+
+            $scope->onDispose(static function () use ($bus, $subscriber): void {
+                $idx = array_search($subscriber, $bus->subscribers, true);
                 if ($idx !== false) {
-                    array_splice($this->subscribers, $idx, 1);
+                    array_splice($bus->subscribers, $idx, 1);
                 }
 
                 $subscriber->complete();
             });
 
             foreach ($subscriber->consume() as $event) {
-                if ($this->matches($event, $filters)) {
+                if ($bus->matches($event, $filters)) {
                     $out->emit($event);
                 }
             }
         });
+    }
+
+    private static function matchesValue(mixed $actual, mixed $target, bool $addressed = false): bool
+    {
+        if ($addressed && ($target === 'ALL' || $actual === 'ALL')) {
+            return true;
+        }
+
+        $actuals = array_map(self::normalizeFilterValue(...), (array) $actual);
+        $targets = array_map(self::normalizeFilterValue(...), (array) $target);
+
+        return array_intersect($targets, $actuals) !== [];
+    }
+
+    private static function normalizeFilterValue(mixed $value): string
+    {
+        return $value instanceof \BackedEnum ? (string) $value->value : (string) $value;
     }
 
     /** @param array<string, mixed> $filters */
@@ -77,22 +106,5 @@ final class InMemorySwarmBus implements SwarmBus
         }
 
         return true;
-    }
-
-    private static function matchesValue(mixed $actual, mixed $target, bool $addressed = false): bool
-    {
-        if ($addressed && ($target === 'ALL' || $actual === 'ALL')) {
-            return true;
-        }
-
-        $actuals = array_map(self::normalizeFilterValue(...), (array) $actual);
-        $targets = array_map(self::normalizeFilterValue(...), (array) $target);
-
-        return array_intersect($targets, $actuals) !== [];
-    }
-
-    private static function normalizeFilterValue(mixed $value): string
-    {
-        return $value instanceof \BackedEnum ? (string) $value->value : (string) $value;
     }
 }

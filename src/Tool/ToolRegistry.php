@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Phalanx\Athena\Tool;
 
 use Phalanx\Concurrency\RetryPolicy;
+use Phalanx\Task\Retryable;
 
 final class ToolRegistry
 {
@@ -30,15 +31,6 @@ final class ToolRegistry
         }
 
         return $registry;
-    }
-
-    /** @param class-string<Tool> $class */
-    private function register(string $class): void
-    {
-        $schema = SchemaGenerator::generate($class);
-        $name = $schema['name'];
-        $this->tools[$name] = $class;
-        $this->schemas[$name] = $schema;
     }
 
     public function has(string $name): bool
@@ -70,12 +62,25 @@ final class ToolRegistry
     {
         $class = $this->tools[$call->name] ?? null;
 
-        if ($class !== null && is_subclass_of($class, \Phalanx\Task\Retryable::class)) {
-            $ref = new \ReflectionClass($class);
-            $instance = $ref->newInstanceWithoutConstructor();
-            return $instance->retryPolicy;
+        if ($class !== null && is_subclass_of($class, Retryable::class)) {
+            // Prefer a class-declared static default over instantiating an
+            // uninitialized object (newInstanceWithoutConstructor fatals on hooked properties).
+            if (method_exists($class, 'defaultRetryPolicy')) {
+                return $class::defaultRetryPolicy();
+            }
+
+            return RetryPolicy::fixed(1, 0);
         }
 
         return RetryPolicy::fixed(1, 0);
+    }
+
+    /** @param class-string<Tool> $class */
+    private function register(string $class): void
+    {
+        $schema = SchemaGenerator::generate($class);
+        $name = $schema['name'];
+        $this->tools[$name] = $class;
+        $this->schemas[$name] = $schema;
     }
 }

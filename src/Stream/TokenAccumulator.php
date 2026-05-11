@@ -8,8 +8,8 @@ use Phalanx\Athena\AgentResult;
 use Phalanx\Athena\Event\AgentEvent;
 use Phalanx\Athena\Event\AgentEventKind;
 use Phalanx\Athena\Message\Conversation;
+use Phalanx\Scope\ExecutionScope;
 use Phalanx\Styx\Channel;
-use Phalanx\Stream\Contract\StreamContext;
 use Phalanx\Styx\Emitter;
 
 final class TokenAccumulator
@@ -20,47 +20,28 @@ final class TokenAccumulator
     private function __construct(
         private readonly Emitter $events,
         private readonly Channel $textChannel,
-        private readonly StreamContext $ctx,
-    ) {}
+    ) {
+    }
 
-    public static function from(Emitter $events, StreamContext $ctx): self
+    public static function from(Emitter $events, ExecutionScope $ctx): self
     {
         $channel = new Channel(bufferSize: 64);
 
-        $accumulator = new self($events, $channel, $ctx);
-        $accumulator->start();
+        $accumulator = new self($events, $channel);
+
+        // @dev-cleanup-ignore — background coroutine so from() returns immediately; callers stream via text()
+        $ctx->go(static function (ExecutionScope $es) use ($accumulator): void {
+            $accumulator->start($es);
+        }, 'token-accumulator');
 
         return $accumulator;
-    }
-
-    private function start(): void
-    {
-        $ch = $this->textChannel;
-
-        $emitter = $this->events;
-        foreach ($emitter($this->ctx) as $event) {
-            if (!$event instanceof AgentEvent) {
-                continue;
-            }
-
-            if ($event->kind === AgentEventKind::TokenDelta && $event->data->text !== null) {
-                $ch->emit($event->data->text);
-            }
-
-            if ($event->kind === AgentEventKind::AgentComplete && $event->data instanceof AgentResult) {
-                $this->result = $event->data;
-                $this->conversation = $event->data->conversation;
-            }
-        }
-
-        $ch->complete();
     }
 
     public function text(): Emitter
     {
         $textChannel = $this->textChannel;
 
-        return Emitter::produce(static function (Channel $ch) use ($textChannel) {
+        return Emitter::produce(static function (Channel $ch) use ($textChannel): void {
             foreach ($textChannel->consume() as $text) {
                 $ch->emit($text);
             }
@@ -89,5 +70,28 @@ final class TokenAccumulator
         }
 
         return $this->conversation;
+    }
+
+    private function start(ExecutionScope $scope): void
+    {
+        $ch = $this->textChannel;
+
+        $emitter = $this->events;
+        foreach ($emitter($scope) as $event) {
+            if (!$event instanceof AgentEvent) {
+                continue;
+            }
+
+            if ($event->kind === AgentEventKind::TokenDelta && $event->data->text !== null) {
+                $ch->emit($event->data->text);
+            }
+
+            if ($event->kind === AgentEventKind::AgentComplete && $event->data instanceof AgentResult) {
+                $this->result = $event->data;
+                $this->conversation = $event->data->conversation;
+            }
+        }
+
+        $ch->complete();
     }
 }

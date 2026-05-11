@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Phalanx\Athena\Pipeline;
 
-use Phalanx\ExecutionScope;
+use Phalanx\Scope\ExecutionScope;
 use Phalanx\Task\Executable;
 use Phalanx\Task\Scopeable;
 use Phalanx\Task\Task;
@@ -14,11 +14,35 @@ final class Pipeline implements Executable
     /** @var list<array{type: string, value: mixed}> */
     private array $steps = [];
 
-    private function __construct() {}
+    private function __construct()
+    {
+    }
 
     public static function create(): self
     {
         return new self();
+    }
+
+    public function __invoke(ExecutionScope $scope): mixed
+    {
+        $result = null;
+
+        foreach ($this->steps as $step) {
+            $result = match ($step['type']) {
+                'input' => $step['value'],
+                'step' => $scope->execute($step['value']),
+                'branch' => $scope->execute(($step['value'])($result)),
+                'fan' => $scope->concurrent(
+                    ...array_map(
+                        static fn($task) => Task::of(static fn($s) => $s->execute($task)),
+                        $step['value'],
+                    ),
+                ),
+                default => $result,
+            };
+        }
+
+        return $result;
     }
 
     public function step(Scopeable|Executable $task): self
@@ -36,8 +60,8 @@ final class Pipeline implements Executable
         return $clone;
     }
 
-    /** @param list<Scopeable|Executable> $tasks */
-    public function fan(array $tasks): self
+    /** @param Scopeable|Executable ...$tasks */
+    public function fan(Scopeable|Executable ...$tasks): self
     {
         $clone = clone $this;
         $clone->steps[] = ['type' => 'fan', 'value' => $tasks];
@@ -53,27 +77,5 @@ final class Pipeline implements Executable
         }
 
         return $this;
-    }
-
-    public function __invoke(ExecutionScope $scope): mixed
-    {
-        $result = null;
-
-        foreach ($this->steps as $step) {
-            $result = match ($step['type']) {
-                'input' => $step['value'],
-                'step' => $scope->execute($step['value']),
-                'branch' => $scope->execute(($step['value'])($result)),
-                'fan' => $scope->concurrent(
-                    array_map(
-                        static fn($task) => Task::of(static fn($s) => $s->execute($task)),
-                        $step['value'],
-                    ),
-                ),
-                default => $result,
-            };
-        }
-
-        return $result;
     }
 }
